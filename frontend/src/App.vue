@@ -220,6 +220,9 @@
           </div>
         </div>
       </div>
+
+      <!-- Batch Review -->
+      <BatchReview />
     </main>
   </div>
 </template>
@@ -229,6 +232,7 @@ import { computed, onMounted, onUnmounted } from 'vue';
 import { useECGStore } from './store/ecg';
 import ECGWaveform from './components/ECGWaveform.vue';
 import HRVAnalysis from './components/HRVAnalysis.vue';
+import BatchReview from './components/BatchReview.vue';
 import { LEAD_NAMES } from './types';
 
 const store = useECGStore();
@@ -259,6 +263,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   store.stopMonitoring();
+  store.clearBatchReview();
 });
 </script>
 

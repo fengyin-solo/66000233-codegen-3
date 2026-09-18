@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from typing import List
 
 from app.models.schemas import (
@@ -6,18 +6,15 @@ from app.models.schemas import (
     ECGLead,
     ECGAnalysisRequest,
     ECGAnalysisResponse,
+    ECGAnalysisBatchRequest,
+    ECGBatchTaskSnapshot,
     RPeak,
     HRVMetrics,
     ArrhythmiaEvent,
     ArrhythmiaType,
 )
-from app.services.ecg_service import (
-    generate_ecg_signal,
-    pan_tompkins_r_peak_detection,
-    calculate_hrv,
-    detect_arrhythmia,
-    get_rhythm_diagnosis,
-)
+from app.services.ecg_service import perform_analysis
+from app.services.batch_service import batch_task_manager
 
 router = APIRouter()
 
@@ -32,36 +29,34 @@ async def get_available_leads():
 async def analyze_ecg(request: ECGAnalysisRequest):
     """
     Generate and analyze ECG signal for a specified lead.
-    
+
     Performs:
     1. PQRST waveform generation
     2. Pan-Tompkins R-peak detection
     3. HRV metrics calculation
     4. Arrhythmia detection and classification
     """
-    # Generate ECG signal
-    time_array, ecg_signal = generate_ecg_signal(
+    analysis = perform_analysis(
         lead_name=request.lead_name.value,
         duration=request.duration,
         sampling_rate=request.sampling_rate,
         heart_rate=request.heart_rate,
     )
+    ecg_signal = analysis["ecg_signal"]
+    r_peaks_raw = analysis["r_peaks"]
+    hrv_raw = analysis["hrv"]
+    arrhythmia_raw = analysis["arrhythmia_events"]
+    diagnosis = analysis["rhythm_diagnosis"]
 
-    # Detect R-peaks using Pan-Tompkins algorithm
-    r_peaks_raw = pan_tompkins_r_peak_detection(ecg_signal, request.sampling_rate)
     r_peaks = [
         RPeak(index=rp["index"], time=rp["time"], amplitude=rp["amplitude"])
         for rp in r_peaks_raw
     ]
 
     # Calculate HRV metrics
-    hrv_raw = calculate_hrv(r_peaks_raw, request.sampling_rate)
     hrv = HRVMetrics(**hrv_raw)
 
     # Detect arrhythmia events
-    arrhythmia_raw = detect_arrhythmia(
-        r_peaks_raw, hrv_raw, ecg_signal, request.sampling_rate
-    )
     arrhythmia_events = []
     for evt in arrhythmia_raw:
         arrhythmia_events.append(
@@ -72,9 +67,6 @@ async def analyze_ecg(request: ECGAnalysisRequest):
                 timestamp=evt["timestamp"],
             )
         )
-
-    # Generate rhythm diagnosis
-    diagnosis = get_rhythm_diagnosis(arrhythmia_raw, hrv_raw)
 
     # Build lead data
     lead = ECGLead(
@@ -91,3 +83,40 @@ async def analyze_ecg(request: ECGAnalysisRequest):
         arrhythmia_events=arrhythmia_events,
         rhythm_diagnosis=diagnosis,
     )
+
+
+@router.post("/batch/analyze", response_model=ECGBatchTaskSnapshot, status_code=202)
+async def analyze_ecg_batch(request: ECGAnalysisBatchRequest):
+    """
+    Submit a batch review: multiple acquisition parameter sets in one request.
+
+    Items are processed sequentially in submission order through the same
+    pipeline as the single-analysis entry. An item whose parameters are out
+    of the allowed range is skipped (with the reason recorded) while the
+    rest are processed normally. Returns the task snapshot; poll
+    GET /ecg/batch/{task_id} for overall progress and grouped results.
+    """
+    return batch_task_manager.create_task(request.items)
+
+
+@router.get("/batch/{task_id}", response_model=ECGBatchTaskSnapshot)
+async def get_batch_task(task_id: str):
+    """Query overall progress and per-item results of a batch review task."""
+    snapshot = batch_task_manager.get_snapshot(task_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="批量任务不存在")
+    return snapshot
+
+
+@router.post("/batch/{task_id}/resume", response_model=ECGBatchTaskSnapshot)
+async def resume_batch_task(task_id: str):
+    """
+    Resume a failed batch task from the interrupted item.
+
+    Items already completed or skipped keep their results and are never
+    recomputed; only the remaining items are processed.
+    """
+    snapshot = batch_task_manager.resume_task(task_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="批量任务不存在")
+    return snapshot

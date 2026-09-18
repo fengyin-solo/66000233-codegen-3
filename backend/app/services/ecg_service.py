@@ -334,6 +334,50 @@ def detect_arrhythmia(
     return events
 
 
+def perform_analysis(
+    lead_name: str = "II",
+    duration: float = 10.0,
+    sampling_rate: int = 500,
+    heart_rate: float = 72.0,
+) -> Dict[str, Any]:
+    """
+    Run the full ECG analysis pipeline for one set of acquisition parameters.
+
+    Shared by the single-analysis entry and the batch review service so that
+    identical parameters always yield identical conclusions through both paths.
+
+    Returns:
+        Dict with ecg_signal, r_peaks, hrv, arrhythmia_events, rhythm_diagnosis
+    """
+    # Generate ECG signal
+    time_array, ecg_signal = generate_ecg_signal(
+        lead_name=lead_name,
+        duration=duration,
+        sampling_rate=sampling_rate,
+        heart_rate=heart_rate,
+    )
+
+    # Detect R-peaks using Pan-Tompkins algorithm
+    r_peaks_raw = pan_tompkins_r_peak_detection(ecg_signal, sampling_rate)
+
+    # Calculate HRV metrics
+    hrv_raw = calculate_hrv(r_peaks_raw, sampling_rate)
+
+    # Detect arrhythmia events
+    arrhythmia_raw = detect_arrhythmia(r_peaks_raw, hrv_raw, ecg_signal, sampling_rate)
+
+    # Generate rhythm diagnosis
+    diagnosis = get_rhythm_diagnosis(arrhythmia_raw, hrv_raw)
+
+    return {
+        "ecg_signal": ecg_signal,
+        "r_peaks": r_peaks_raw,
+        "hrv": hrv_raw,
+        "arrhythmia_events": arrhythmia_raw,
+        "rhythm_diagnosis": diagnosis,
+    }
+
+
 def get_rhythm_diagnosis(arrhythmia_events: List[Dict[str, Any]], hrv: Dict[str, Any]) -> str:
     """Generate overall rhythm diagnosis based on detected events and HRV."""
     event_types = [e["event_type"] for e in arrhythmia_events]

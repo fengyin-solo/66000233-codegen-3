@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse } from '../types';
+import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse, BatchTaskSnapshot, BatchParamRow } from '../types';
 
 // Gaussian function for PQRST wave simulation
 function gaussian(x: number, amplitude: number, center: number, width: number): number {
@@ -58,7 +58,13 @@ export const useECGStore = defineStore('ecg', () => {
   const useBackend = ref<boolean>(false);
   const backendUrl = ref<string>('http://localhost:8000');
 
+  // Batch review state
+  const batchTask = ref<BatchTaskSnapshot | null>(null);
+  const isBatchSubmitting = ref<boolean>(false);
+  const batchError = ref<string>('');
+
   let animationTimer: ReturnType<typeof setInterval> | null = null;
+  let batchPollTimer: ReturnType<typeof setInterval> | null = null;
   let scrollOffset = ref<number>(0);
 
   // Getters
@@ -380,6 +386,139 @@ export const useECGStore = defineStore('ecg', () => {
     }
   }
 
+  // ---------- Batch review (批量复核) ----------
+
+  /** Map the backend batch snapshot (snake_case) to the frontend model */
+  function mapBatchSnapshot(data: any): BatchTaskSnapshot {
+    return {
+      taskId: data.task_id,
+      status: data.status,
+      total: data.total,
+      processed: data.processed,
+      progress: data.progress,
+      error: data.error,
+      createdAt: data.created_at,
+      updatedAt: data.updated_at,
+      results: (data.results ?? []).map((r: any) => ({
+        index: r.index,
+        itemId: r.item_id,
+        status: r.status,
+        conclusion: r.conclusion,
+        confidence: r.confidence,
+        hrv: r.hrv
+          ? {
+              heartRate: r.hrv.heart_rate,
+              sdnn: r.hrv.sdnn,
+              rmssd: r.hrv.rmssd,
+              pnn50: r.hrv.pnn50,
+              nnIntervals: r.hrv.nn_intervals,
+            }
+          : null,
+        arrhythmiaEvents: r.arrhythmia_events
+          ? r.arrhythmia_events.map((evt: any) => ({
+              eventType: evt.event_type,
+              confidence: evt.confidence,
+              description: evt.description,
+              timestamp: evt.timestamp,
+            }))
+          : null,
+        error: r.error,
+      })),
+    };
+  }
+
+  function stopBatchPolling() {
+    if (batchPollTimer) {
+      clearInterval(batchPollTimer);
+      batchPollTimer = null;
+    }
+  }
+
+  function startBatchPolling() {
+    stopBatchPolling();
+    batchPollTimer = setInterval(async () => {
+      await refreshBatchStatus();
+    }, 500);
+  }
+
+  /**
+   * Submit a batch review: multiple acquisition parameter sets at once.
+   * The backend processes them sequentially in submission order.
+   */
+  async function submitBatchReview(rows: BatchParamRow[]) {
+    isBatchSubmitting.value = true;
+    batchError.value = '';
+    try {
+      const response = await fetch(`${backendUrl.value}/ecg/batch/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          items: rows.map((row) => ({
+            item_id: row.itemId || undefined,
+            lead_name: row.leadName,
+            duration: row.duration,
+            sampling_rate: row.samplingRate,
+            heart_rate: row.heartRate,
+          })),
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(`批量提交失败 (HTTP ${response.status})`);
+      }
+      batchTask.value = mapBatchSnapshot(await response.json());
+      startBatchPolling();
+    } catch (error) {
+      console.error('Batch submit error:', error);
+      batchError.value = error instanceof Error ? error.message : '批量提交失败';
+    } finally {
+      isBatchSubmitting.value = false;
+    }
+  }
+
+  /** Poll overall progress of the running batch task */
+  async function refreshBatchStatus() {
+    if (!batchTask.value) return;
+    try {
+      const response = await fetch(`${backendUrl.value}/ecg/batch/${batchTask.value.taskId}`);
+      if (!response.ok) return;
+      batchTask.value = mapBatchSnapshot(await response.json());
+      if (batchTask.value.status === 'completed' || batchTask.value.status === 'failed') {
+        stopBatchPolling();
+      }
+    } catch (error) {
+      console.error('Batch status polling error:', error);
+    }
+  }
+
+  /** Resume a failed batch task from the interrupted item */
+  async function resumeBatchReview() {
+    if (!batchTask.value) return;
+    batchError.value = '';
+    try {
+      const response = await fetch(
+        `${backendUrl.value}/ecg/batch/${batchTask.value.taskId}/resume`,
+        { method: 'POST' }
+      );
+      if (!response.ok) {
+        throw new Error(`续跑失败 (HTTP ${response.status})`);
+      }
+      batchTask.value = mapBatchSnapshot(await response.json());
+      if (batchTask.value.status !== 'completed') {
+        startBatchPolling();
+      }
+    } catch (error) {
+      console.error('Batch resume error:', error);
+      batchError.value = error instanceof Error ? error.message : '续跑失败';
+    }
+  }
+
+  /** Clear the current batch task and stop polling */
+  function clearBatchReview() {
+    stopBatchPolling();
+    batchTask.value = null;
+    batchError.value = '';
+  }
+
   return {
     // State
     selectedLead,
@@ -395,6 +534,9 @@ export const useECGStore = defineStore('ecg', () => {
     useBackend,
     backendUrl,
     scrollOffset,
+    batchTask,
+    isBatchSubmitting,
+    batchError,
     // Getters
     currentSamples,
     currentRPeaks,
@@ -409,5 +551,9 @@ export const useECGStore = defineStore('ecg', () => {
     detectRPeaks,
     calculateHRV,
     detectArrhythmias,
+    submitBatchReview,
+    refreshBatchStatus,
+    resumeBatchReview,
+    clearBatchReview,
   };
 });
