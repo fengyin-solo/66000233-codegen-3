@@ -80,6 +80,35 @@
         <p class="text-xs text-gray-500 mt-1 ml-6">连接 FastAPI 后端分析服务</p>
       </div>
 
+      <!-- View Switch -->
+      <div class="mb-5">
+        <h3 class="text-sm font-semibold text-gray-300 mb-2">功能视图</h3>
+        <div class="grid grid-cols-2 gap-1.5">
+          <button
+            @click="activeView = 'monitor'"
+            :class="[
+              'px-2 py-1.5 rounded text-xs font-medium transition-all',
+              activeView === 'monitor'
+                ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/50'
+                : 'bg-gray-800 text-gray-400 border border-gray-700 hover:border-gray-600 hover:text-gray-300',
+            ]"
+          >
+            实时监测
+          </button>
+          <button
+            @click="activeView = 'batch'"
+            :class="[
+              'px-2 py-1.5 rounded text-xs font-medium transition-all',
+              activeView === 'batch'
+                ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/50'
+                : 'bg-gray-800 text-gray-400 border border-gray-700 hover:border-gray-600 hover:text-gray-300',
+            ]"
+          >
+            批量复核
+          </button>
+        </div>
+      </div>
+
       <!-- Control Buttons -->
       <div class="space-y-2 mt-auto">
         <button
@@ -117,6 +146,11 @@
 
     <!-- Main Content -->
     <main class="flex-1 overflow-y-auto p-5 space-y-4">
+      <!-- 批量复核视图 -->
+      <BatchReview v-if="activeView === 'batch'" />
+
+      <!-- 实时监测视图（原有界面保持不变） -->
+      <template v-else>
       <!-- Status Bar -->
       <div class="flex items-center justify-between bg-gray-900/60 rounded-lg px-4 py-2.5 border border-gray-800">
         <div class="flex items-center gap-3">
@@ -220,19 +254,22 @@
           </div>
         </div>
       </div>
+      </template>
     </main>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { useECGStore } from './store/ecg';
 import ECGWaveform from './components/ECGWaveform.vue';
 import HRVAnalysis from './components/HRVAnalysis.vue';
+import BatchReview from './components/BatchReview.vue';
 import { LEAD_NAMES } from './types';
 
 const store = useECGStore();
 const leadNames = LEAD_NAMES;
+const activeView = ref<'monitor' | 'batch'>('monitor');
 
 const avgRR = computed(() => {
   if (!store.hrvData || store.hrvData.nnIntervals.length === 0) return '--';
@@ -259,6 +296,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   store.stopMonitoring();
+  store.stopBatchPolling();
 });
 </script>
 

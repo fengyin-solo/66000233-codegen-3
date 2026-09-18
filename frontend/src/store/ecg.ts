@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse } from '../types';
+import type { ECGLead, HRVData, RPeak, ArrhythmiaEvent, ECGAnalysisResponse, BatchParams, BatchJob } from '../types';
 
 // Gaussian function for PQRST wave simulation
 function gaussian(x: number, amplitude: number, center: number, width: number): number {
@@ -58,7 +58,13 @@ export const useECGStore = defineStore('ecg', () => {
   const useBackend = ref<boolean>(false);
   const backendUrl = ref<string>('http://localhost:8000');
 
+  // 批量复核状态
+  const batchJob = ref<BatchJob | null>(null);
+  const batchSubmitting = ref<boolean>(false);
+  const batchError = ref<string>('');
+
   let animationTimer: ReturnType<typeof setInterval> | null = null;
+  let batchPollTimer: ReturnType<typeof setInterval> | null = null;
   let scrollOffset = ref<number>(0);
 
   // Getters
@@ -360,6 +366,96 @@ export const useECGStore = defineStore('ecg', () => {
     }
   }
 
+  // -----------------------------------------------------------------------
+  // 批量复核：一次提交多条采集参数，后端按提交顺序逐条复核并整组返回
+  // -----------------------------------------------------------------------
+
+  /**
+   * 提交批量复核任务，随后轮询整体进度直至结束
+   */
+  async function submitBatch(items: BatchParams[]) {
+    batchSubmitting.value = true;
+    batchError.value = '';
+    stopBatchPolling();
+    try {
+      const resp = await fetch(`${backendUrl.value}/ecg/batch/analyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items }),
+      });
+      if (!resp.ok) {
+        throw new Error(`批量复核提交失败 (HTTP ${resp.status})`);
+      }
+      batchJob.value = await resp.json();
+      startBatchPolling();
+    } catch (error: any) {
+      batchError.value = error?.message ?? '批量复核提交失败';
+      throw error;
+    } finally {
+      batchSubmitting.value = false;
+    }
+  }
+
+  /**
+   * 拉取整组最新状态（进行中可查询整体进度）
+   */
+  async function refreshBatch() {
+    if (!batchJob.value) return;
+    try {
+      const resp = await fetch(`${backendUrl.value}/ecg/batch/${batchJob.value.batch_id}`);
+      if (resp.ok) {
+        batchJob.value = await resp.json();
+      }
+    } catch (error) {
+      console.error('Batch progress query error:', error);
+    }
+  }
+
+  function startBatchPolling() {
+    stopBatchPolling();
+    batchPollTimer = setInterval(async () => {
+      await refreshBatch();
+      const status = batchJob.value?.status;
+      if (status === 'completed' || status === 'failed') {
+        stopBatchPolling();
+      }
+    }, 400);
+  }
+
+  function stopBatchPolling() {
+    if (batchPollTimer) {
+      clearInterval(batchPollTimer);
+      batchPollTimer = null;
+    }
+  }
+
+  /**
+   * 中途失败后从失败处续跑，已算完的部分后端不会重复计算
+   */
+  async function resumeBatch() {
+    if (!batchJob.value) return;
+    batchError.value = '';
+    try {
+      const resp = await fetch(
+        `${backendUrl.value}/ecg/batch/${batchJob.value.batch_id}/resume`,
+        { method: 'POST' }
+      );
+      if (!resp.ok) {
+        throw new Error(`续跑失败 (HTTP ${resp.status})`);
+      }
+      batchJob.value = await resp.json();
+      startBatchPolling();
+    } catch (error: any) {
+      batchError.value = error?.message ?? '续跑失败';
+    }
+  }
+
+  function clearBatch() {
+    stopBatchPolling();
+    batchJob.value = null;
+    batchError.value = '';
+  }
+
   /**
    * Select a different ECG lead
    */
@@ -395,6 +491,9 @@ export const useECGStore = defineStore('ecg', () => {
     useBackend,
     backendUrl,
     scrollOffset,
+    batchJob,
+    batchSubmitting,
+    batchError,
     // Getters
     currentSamples,
     currentRPeaks,
@@ -409,5 +508,10 @@ export const useECGStore = defineStore('ecg', () => {
     detectRPeaks,
     calculateHRV,
     detectArrhythmias,
+    submitBatch,
+    refreshBatch,
+    resumeBatch,
+    clearBatch,
+    stopBatchPolling,
   };
 });

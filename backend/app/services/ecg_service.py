@@ -3,6 +3,16 @@ from scipy import signal
 from typing import List, Tuple, Dict, Any
 import math
 
+from app.models.schemas import (
+    ECGAnalysisRequest,
+    ECGAnalysisResponse,
+    ECGLead,
+    RPeak,
+    HRVMetrics,
+    ArrhythmiaEvent,
+    ArrhythmiaType,
+)
+
 
 def gaussian(x: np.ndarray, amplitude: float, center: float, width: float) -> np.ndarray:
     """Generate a Gaussian function for ECG wave simulation."""
@@ -352,3 +362,67 @@ def get_rhythm_diagnosis(arrhythmia_events: List[Dict[str, Any]], hrv: Dict[str,
         hr = hrv.get("heart_rate", 0)
         sdnn = hrv.get("sdnn", 0)
         return f"正常窦性心律 | HR: {hr:.0f} BPM | SDNN: {sdnn:.1f} ms"
+
+
+def analyze_request(request: ECGAnalysisRequest) -> ECGAnalysisResponse:
+    """
+    Run the full analysis pipeline for one set of acquisition parameters:
+    signal generation -> Pan-Tompkins R-peak detection -> HRV -> arrhythmia
+    detection -> rhythm diagnosis.
+
+    Shared by the single-item endpoint and the batch review service so that
+    both always produce the same conclusion and confidence for the same
+    parameters.
+    """
+    # Generate ECG signal
+    time_array, ecg_signal = generate_ecg_signal(
+        lead_name=request.lead_name.value,
+        duration=request.duration,
+        sampling_rate=request.sampling_rate,
+        heart_rate=request.heart_rate,
+    )
+
+    # Detect R-peaks using Pan-Tompkins algorithm
+    r_peaks_raw = pan_tompkins_r_peak_detection(ecg_signal, request.sampling_rate)
+    r_peaks = [
+        RPeak(index=rp["index"], time=rp["time"], amplitude=rp["amplitude"])
+        for rp in r_peaks_raw
+    ]
+
+    # Calculate HRV metrics
+    hrv_raw = calculate_hrv(r_peaks_raw, request.sampling_rate)
+    hrv = HRVMetrics(**hrv_raw)
+
+    # Detect arrhythmia events
+    arrhythmia_raw = detect_arrhythmia(
+        r_peaks_raw, hrv_raw, ecg_signal, request.sampling_rate
+    )
+    arrhythmia_events = []
+    for evt in arrhythmia_raw:
+        arrhythmia_events.append(
+            ArrhythmiaEvent(
+                event_type=ArrhythmiaType(evt["event_type"]),
+                confidence=evt["confidence"],
+                description=evt["description"],
+                timestamp=evt["timestamp"],
+            )
+        )
+
+    # Generate rhythm diagnosis
+    diagnosis = get_rhythm_diagnosis(arrhythmia_raw, hrv_raw)
+
+    # Build lead data
+    lead = ECGLead(
+        lead_name=request.lead_name,
+        sampling_rate=request.sampling_rate,
+        duration=request.duration,
+        samples=[round(float(s), 4) for s in ecg_signal],
+        r_peaks=r_peaks,
+    )
+
+    return ECGAnalysisResponse(
+        lead=lead,
+        hrv=hrv,
+        arrhythmia_events=arrhythmia_events,
+        rhythm_diagnosis=diagnosis,
+    )

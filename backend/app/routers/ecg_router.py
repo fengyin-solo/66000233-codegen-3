@@ -1,23 +1,16 @@
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException
 from typing import List
 
 from app.models.schemas import (
     LeadName,
-    ECGLead,
     ECGAnalysisRequest,
     ECGAnalysisResponse,
-    RPeak,
-    HRVMetrics,
-    ArrhythmiaEvent,
-    ArrhythmiaType,
+    ECGBatchAnalyzeRequest,
+    BatchJobResponse,
+    BatchProgressResponse,
 )
-from app.services.ecg_service import (
-    generate_ecg_signal,
-    pan_tompkins_r_peak_detection,
-    calculate_hrv,
-    detect_arrhythmia,
-    get_rhythm_diagnosis,
-)
+from app.services import batch_service
+from app.services.ecg_service import analyze_request
 
 router = APIRouter()
 
@@ -32,62 +25,64 @@ async def get_available_leads():
 async def analyze_ecg(request: ECGAnalysisRequest):
     """
     Generate and analyze ECG signal for a specified lead.
-    
+
     Performs:
     1. PQRST waveform generation
     2. Pan-Tompkins R-peak detection
     3. HRV metrics calculation
     4. Arrhythmia detection and classification
     """
-    # Generate ECG signal
-    time_array, ecg_signal = generate_ecg_signal(
-        lead_name=request.lead_name.value,
-        duration=request.duration,
-        sampling_rate=request.sampling_rate,
-        heart_rate=request.heart_rate,
-    )
+    return analyze_request(request)
 
-    # Detect R-peaks using Pan-Tompkins algorithm
-    r_peaks_raw = pan_tompkins_r_peak_detection(ecg_signal, request.sampling_rate)
-    r_peaks = [
-        RPeak(index=rp["index"], time=rp["time"], amplitude=rp["amplitude"])
-        for rp in r_peaks_raw
-    ]
 
-    # Calculate HRV metrics
-    hrv_raw = calculate_hrv(r_peaks_raw, request.sampling_rate)
-    hrv = HRVMetrics(**hrv_raw)
+@router.post("/batch/analyze", response_model=BatchJobResponse, status_code=202)
+async def analyze_batch(request: ECGBatchAnalyzeRequest):
+    """
+    提交批量复核任务。
 
-    # Detect arrhythmia events
-    arrhythmia_raw = detect_arrhythmia(
-        r_peaks_raw, hrv_raw, ecg_signal, request.sampling_rate
-    )
-    arrhythmia_events = []
-    for evt in arrhythmia_raw:
-        arrhythmia_events.append(
-            ArrhythmiaEvent(
-                event_type=ArrhythmiaType(evt["event_type"]),
-                confidence=evt["confidence"],
-                description=evt["description"],
-                timestamp=evt["timestamp"],
-            )
-        )
+    一次提交多条采集参数，后端按提交顺序逐条复核（结论与把握程度与单条
+    入口一致），立即返回任务句柄；处理过程中可查询整体进度，全部算完后
+    通过查询接口整组取回结果。
+    """
+    job = batch_service.create_batch(request.items)
+    return batch_service.to_response(job)
 
-    # Generate rhythm diagnosis
-    diagnosis = get_rhythm_diagnosis(arrhythmia_raw, hrv_raw)
 
-    # Build lead data
-    lead = ECGLead(
-        lead_name=request.lead_name,
-        sampling_rate=request.sampling_rate,
-        duration=request.duration,
-        samples=[round(float(s), 4) for s in ecg_signal],
-        r_peaks=r_peaks,
-    )
+@router.get("/batch/{batch_id}", response_model=BatchJobResponse)
+async def get_batch(batch_id: str):
+    """
+    查询批量复核整组状态与各条结果。
 
-    return ECGAnalysisResponse(
-        lead=lead,
-        hrv=hrv,
-        arrhythmia_events=arrhythmia_events,
-        rhythm_diagnosis=diagnosis,
-    )
+    每条结果的内容与单条入口 /ecg/analyze 的返回保持一致；
+    参数超出允许范围的条目状态为 skipped 并指明哪一项不合格。
+    """
+    job = batch_service.get_batch(batch_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"批量复核任务不存在: {batch_id}")
+    return batch_service.to_response(job)
+
+
+@router.get("/batch/{batch_id}/progress", response_model=BatchProgressResponse)
+async def get_batch_progress(batch_id: str):
+    """查询批量复核整体进度（轻量接口，不含各条结果内容）。"""
+    job = batch_service.get_batch(batch_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"批量复核任务不存在: {batch_id}")
+    return batch_service.to_progress(job)
+
+
+@router.post("/batch/{batch_id}/resume", response_model=BatchJobResponse)
+async def resume_batch(batch_id: str):
+    """
+    从中途失败处接着跑。
+
+    仅失败状态的任务可续跑；已算完的部分不重复计算，
+    从失败的那一条继续按顺序复核。
+    """
+    result = batch_service.resume_batch(batch_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"批量复核任务不存在: {batch_id}")
+    job, started = result
+    if not started:
+        raise HTTPException(status_code=409, detail="仅失败状态的批量复核任务可以续跑")
+    return batch_service.to_response(job)
